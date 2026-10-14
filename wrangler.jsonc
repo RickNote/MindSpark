@@ -2,6 +2,10 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "mindspark",
   "compatibility_date": "2026-06-11",
+  "routes": [
+    { "pattern": "mindspark.ricknote.net", "custom_domain": true }
+  ],
+  "workers_dev": true,
   "observability": {
     "enabled": true
   },
