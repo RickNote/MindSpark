@@ -62,6 +62,83 @@ const ServerStore = {
 };
 
 /* ------------------------------------------------------------
+   LocalStore - single-user mode on a static host with NO backend.
+   Maps live in this browser's localStorage, one key per map plus a small
+   index of metadata. Version snapshots use the same 60 s refine window and
+   the same history()/version() contract as ServerStore, so MODE='server'
+   drives every UI path and no login/collab UI appears.
+   Activated once via ?local=1 (choice persisted); ?local=0 goes back.
+   ------------------------------------------------------------ */
+const LOCAL_PREFIX='mindspark:local:';
+const LOCAL_INDEX_KEY=LOCAL_PREFIX+'index';
+const LOCAL_FLAG_KEY=LOCAL_PREFIX+'enabled';
+const LOCAL_MAX_VERSIONS=30;
+const LOCAL_VERSION_WINDOW_MS=60*1000;
+function localModeRequested(){
+  try{
+    const p=new URLSearchParams(location.search).get('local');
+    if(p==='1'){ localStorage.setItem(LOCAL_FLAG_KEY,'1'); return true; }
+    if(p==='0'){ localStorage.removeItem(LOCAL_FLAG_KEY); return false; }
+  }catch(e){}
+  try{ return localStorage.getItem(LOCAL_FLAG_KEY)==='1'; }catch(e){ return false; }
+}
+function _localRead(key, fallback){
+  try{ const s=localStorage.getItem(key); return s==null?fallback:JSON.parse(s); }
+  catch(e){ return fallback; }
+}
+const LocalStore = {
+  _index(){ const a=_localRead(LOCAL_INDEX_KEY,[]); return Array.isArray(a)?a:[]; },
+  _writeIndex(a){ localStorage.setItem(LOCAL_INDEX_KEY, JSON.stringify(a)); },
+  async list(){ return this._index(); },
+  async get(id){ return _localRead(LOCAL_PREFIX+'map:'+id, null); },
+  async save(map){
+    map.updated=Date.now();
+    const body=JSON.stringify(map);
+    const idx=this._index();
+    const pos=idx.findIndex(x=>x.id===map.id);
+    const meta={id:map.id, title:map.title||'Untitled map', color:map.color||null, updated:map.updated};
+    // Content key first - if quota fails here nothing is half-updated.
+    localStorage.setItem(LOCAL_PREFIX+'map:'+map.id, body);
+    if(pos>=0) idx[pos]=meta; else { idx.unshift(meta); }
+    idx.sort((a,b)=>(b.updated||0)-(a.updated||0));
+    this._writeIndex(idx);
+    this._snapshot(map.id, body);
+  },
+  async remove(id){
+    try{ localStorage.removeItem(LOCAL_PREFIX+'map:'+id); }catch(e){}
+    try{ localStorage.removeItem(LOCAL_PREFIX+'hist:'+id); }catch(e){}
+    this._writeIndex(this._index().filter(x=>x.id!==id));
+  },
+  _snapshot(id, body){
+    const list=_localRead(LOCAL_PREFIX+'hist:'+id, []);
+    if(!Array.isArray(list)||!list.length){
+      try{ localStorage.setItem(LOCAL_PREFIX+'hist:'+id, JSON.stringify([{ts:Date.now(),d:body}])); }catch(e){}
+      return;
+    }
+    const latest=list[0];
+    if(latest.d===body) return;                       // no-op autosave
+    if(Date.now()-latest.ts<LOCAL_VERSION_WINDOW_MS) latest.d=body;   // refine the current version
+    else list.unshift({ts:Date.now(), d:body});
+    // Persist with the full cap first; on quota, retry with progressively
+    // fewer versions - history must never block the actual save.
+    const write=n=>{ try{ localStorage.setItem(LOCAL_PREFIX+'hist:'+id, JSON.stringify(list.slice(0,n))); return true; }catch(e){ return false; } };
+    if(write(LOCAL_MAX_VERSIONS)) return;
+    let n=Math.floor(LOCAL_MAX_VERSIONS/2);
+    while(n>1){ if(write(n)) return; n=Math.floor(n/2); }
+    try{ write(1); }catch(e){}
+  },
+  async history(id){
+    return _localRead(LOCAL_PREFIX+'hist:'+id, []).map(v=>({ts:v.ts}));
+  },
+  async version(id, ref){
+    const ts=Number(ref);
+    const v=_localRead(LOCAL_PREFIX+'hist:'+id, []).find(x=>x.ts===ts);
+    if(!v) return null;
+    try{ return JSON.parse(v.d); }catch(e){ return null; }
+  }
+};
+
+/* ------------------------------------------------------------
    Forge registry - which git host CloudStore talks to.
 
    Gitea deliberately mirrors GitHub's contents API and Forgejo is a Gitea
@@ -1126,6 +1203,7 @@ function probeHealth(){
   return _healthProbe;
 }
 async function initStore(){
+  if(localModeRequested()){ Store=LocalStore; MODE='server'; return {mode:'local', loggedIn:true}; }
   if(await probeHealth()==='server'){ Store=ServerStore; MODE='server'; return {mode:'server', loggedIn:true}; }
   Store=CloudStore; MODE='cloud';
   const loggedIn=await CloudStore.tryInit();
@@ -7656,6 +7734,8 @@ async function _runSave(target, retried){
       // the edit isn't lost there. The server has no such copy - say so honestly.
       toast((MODE==='cloud')
         ? 'Couldn’t sync to '+forgeName()+' just now - your changes are saved on this device and will retry.'
+        : (Store===LocalStore)
+        ? 'Couldn’t save to this browser (storage full?) - retrying. Export important maps to JSON as a backup.'
         : 'Couldn’t reach the server - retrying in a few seconds. Keep this tab open until it says Saved.');
       retry=true;
     } else {
@@ -15143,6 +15223,14 @@ const PREFS = [
   { key:'mindspark:custom-theme',      kind:'content',   section:'My content', label:'Custom theme',      show:v=>{ try{ return JSON.parse(v).name; }catch(e){ return '(unreadable)'; } } },
   { key:'mindspark:layouts',           kind:'content',   section:'My content', label:'Custom layouts',    show:v=>{ try{ return JSON.parse(v).map(l=>l.name).join(', '); }catch(e){ return '(unreadable)'; } } },
   { key:'mindspark:userTemplates',     kind:'content',   section:'My content', label:'Saved templates',   show:v=>{ try{ return JSON.parse(v).map(t=>t.name).join(', '); }catch(e){ return '(unreadable)'; } } },
+  // LocalStore mode (no backend; maps live in this browser). Specific rows
+  // first; the bare prefix row last is the registry guard for the LOCAL_PREFIX
+  // literal ('mindspark:local:x' placeholder) and a catch-all.
+  { key:'mindspark:local:enabled',     kind:'pref',      section:'Account',    label:'Local-only mode',   show:v=>v==='1'?'on (maps in this browser)':'off' },
+  { key:'mindspark:local:index',       kind:'content',   section:'My content', label:'Local maps index',  show:v=>{ try{ return JSON.parse(v).length+' map(s)'; }catch(e){ return '(unreadable)'; } } },
+  { prefix:'mindspark:local:map:',     kind:'content',   section:'My content', label:'Local map',         show:(v,k)=>{ try{ return (JSON.parse(v).title||'Untitled')+' ('+k.slice('mindspark:local:map:'.length)+')'; }catch(e){ return '(unreadable)'; } } },
+  { prefix:'mindspark:local:hist:',    kind:'content',   section:'My content', label:'Local map history', show:(v,k)=>{ try{ return JSON.parse(v).length+' version(s) ('+k.slice('mindspark:local:hist:'.length)+')'; }catch(e){ return '(unreadable)'; } } },
+  { prefix:'mindspark:local:',         kind:'content',   section:'My content', label:'Local-only data',   show:(v,k)=>k },
   // Caches - never edited, only counted; "Clear everything" removes them
   { prefix:'mindspark:backup:',        kind:'cache',     section:'Storage',    label:'Local map backups' },
   { prefix:'mindspark:view:',          kind:'cache',     section:'Storage',    label:'Remembered camera positions' },
@@ -15335,7 +15423,10 @@ function showPreferences(){
       }) : null);
     // Account
     const ac=section('account','Account');
-    if(MODE==='server'){ row(ac, 'Storage', 'local server (SQLite) - no sign-in'); digest('account', 'local server'); }
+    if(MODE==='server'){
+      if(Store===LocalStore){ row(ac, 'Storage', 'this browser (localStorage) - no sign-in'); digest('account', 'local browser'); }
+      else { row(ac, 'Storage', 'local server (SQLite) - no sign-in'); digest('account', 'local server'); }
+    }
     else {
       const user=(typeof CloudStore!=='undefined' && CloudStore.user) ? (CloudStore.user.login||CloudStore.user.username||'') : '';
       digest('account', user ? user+' on '+forgeName() : 'not signed in');
